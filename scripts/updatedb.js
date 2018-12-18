@@ -8,7 +8,8 @@ if(!process.env.npm_package_config_update){
 
 var cp = require('child_process');
 var fs = require('fs');
-var http = require('https');
+var http = require('http');
+var https = require('https');
 var path = require('path');
 var url = require('url');
 var zlib = require('zlib');
@@ -114,7 +115,7 @@ Host: url.parse(downloadUrl).host
 
     mkdir(tmpFile);
 
-    var client = http.get(getOptions(), onResponse);
+    var client = https.get(getOptions(), onResponse);
 
     process.stdout.write('Retrieving ' + fileName + ' ...');
 }

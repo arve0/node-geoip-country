@@ -26,7 +26,6 @@ var Address4 = require('ip-address').Address4;
 var dataPath = path.join(__dirname, '..', 'data');
 var tmpPath = path.join(__dirname, '..', 'tmp');
 var countryLookup = {};
-var cityLookup = {};
 var databases = [
 	{
 		type: 'country',
@@ -288,9 +287,9 @@ function processCountryData(src, dest, cb) {
 				process.stdout.write('\nStill working (' + lines + ') ...');
 			}
 		}
-	}
+    }
 
-	var dataFile = path.join(dataPath, dest);
+    var dataFile = path.join(dataPath, dest);
 	var tmpDataFile = path.join(tmpPath, src);
 
 	rimraf(dataFile);
@@ -313,169 +312,6 @@ function processCountryData(src, dest, cb) {
 		});
 }
 
-function processCityData(src, dest, cb) {
-	var lines = 0;
-	function processLine(line) {
-		if (line.match(/^Copyright/) || !line.match(/\d/)) {
-			return;
-		}
-
-		var fields = CSVtoArray(line);
-		if (!fields) {
-			console.log("weird line: %s::", line);
-			return;
-		}
-		var sip;
-		var eip;
-		var rngip;
-		var locId;
-		var b;
-		var bsz;
-
-		var i;
-
-		lines++;
-
-		if (fields[0].match(/:/)) {
-			// IPv6
-			var offset = 0;
-			bsz = 48;
-			rngip = new Address6(fields[0]);
-			sip = utils.aton6(rngip.startAddress().correctForm());
-			eip = utils.aton6(rngip.endAddress().correctForm());
-			locId = parseInt(fields[1], 10);
-			locId = cityLookup[locId];
-
-			b = Buffer.alloc(bsz);
-			b.fill(0);
-
-			for (i = 0; i < sip.length; i++) {
-				b.writeUInt32BE(sip[i], offset);
-				offset += 4;
-			}
-
-			for (i = 0; i < eip.length; i++) {
-				b.writeUInt32BE(eip[i], offset);
-				offset += 4;
-			}
-			b.writeUInt32BE(locId>>>0, 32);
-
-			var lat = Math.round(parseFloat(fields[7]) * 10000);
-			var lon = Math.round(parseFloat(fields[8]) * 10000);
-			var area = parseInt(fields[9], 10);
-			b.writeInt32BE(lat,36);
-			b.writeInt32BE(lon,40);
-			b.writeInt32BE(area,44);
-		} else {
-			// IPv4
-			bsz = 24;
-
-			rngip = new Address4(fields[0]);
-			sip = parseInt(rngip.startAddress().bigInteger(),10);
-			eip = parseInt(rngip.endAddress().bigInteger(),10);
-			locId = parseInt(fields[1], 10);
-			locId = cityLookup[locId];
-			b = Buffer.alloc(bsz);
-			b.fill(0);
-			b.writeUInt32BE(sip>>>0, 0);
-			b.writeUInt32BE(eip>>>0, 4);
-			b.writeUInt32BE(locId>>>0, 8);
-
-			var lat = Math.round(parseFloat(fields[7]) * 10000);
-			var lon = Math.round(parseFloat(fields[8]) * 10000);
-			var area = parseInt(fields[9], 10);
-			b.writeInt32BE(lat,12);
-			b.writeInt32BE(lon,16);
-			b.writeInt32BE(area,20);
-		}
-
-		fs.writeSync(datFile, b, 0, b.length, null);
-		if(Date.now() - tstart > 5000) {
-			tstart = Date.now();
-			process.stdout.write('\nStill working (' + lines + ') ...');
-		}
-	}
-
-	var dataFile = path.join(dataPath, dest);
-	var tmpDataFile = path.join(tmpPath, src);
-
-	rimraf(dataFile);
-
-	process.stdout.write('Processing Data (may take a moment) ...');
-	var tstart = Date.now();
-	var datFile = fs.openSync(dataFile, "w");
-
-	lazy(fs.createReadStream(tmpDataFile))
-		.lines
-		.map(function(byteArray) {
-			return iconv.decode(byteArray, 'latin1');
-		})
-		.skip(1)
-		.map(processLine)
-		.on('pipe', cb);
-}
-
-function processCityDataNames(src, dest, cb) {
-	var locId = null;
-	var linesCount = 0;
-	function processLine(line, i, a) {
-		if (line.match(/^Copyright/) || !line.match(/\d/)) {
-			return;
-		}
-
-		var b;
-		var sz = 88;
-		var fields = CSVtoArray(line);
-		if (!fields) {
-			//lot's of cities contain ` or ' in the name and can't be parsed correctly with current method
-			console.log("weird line: %s::", line);
-			return;
-		}
-
-		locId = parseInt(fields[0]);
-
-		cityLookup[locId] = linesCount;
-		var cc = fields[4];
-		var rg = fields[6];
-		var city = fields[10];
-		var metro = parseInt(fields[11]);
-		//other possible fields to include
-		var tz = fields[12];
-		var eu = fields[13];
-
-		b = Buffer.alloc(sz);
-		b.fill(0);
-		b.write(cc, 0);//country code
-		b.write(rg, 2);//region
-
-		if(metro) {
-			b.writeInt32BE(metro, 5);
-		}
-		b.write(eu,9);//is in eu
-		b.write(tz,10);//timezone
-		b.write(city, 34);//cityname
-
-		fs.writeSync(datFile, b, 0, b.length, null);
-		linesCount++;
-	}
-
-	var dataFile = path.join(dataPath, dest);
-	var tmpDataFile = path.join(tmpPath, src);
-
-	rimraf(dataFile);
-
-	var datFile = fs.openSync(dataFile, "w");
-
-	lazy(fs.createReadStream(tmpDataFile))
-		.lines
-		.map(function(byteArray) {
-			return iconv.decode(byteArray, 'utf-8');
-		})
-		.skip(1)
-		.map(processLine)
-		.on('pipe', cb);
-}
-
 function processData(database, cb) {
 	var type = database.type;
 	var src = database.src;
@@ -484,24 +320,12 @@ function processData(database, cb) {
 	if (type === 'country') {
 		if(Array.isArray(src)){
 			processLookupCountry(src[0], function() {
-				processCountryData(src[1], dest[1], function() {
-					processCountryData(src[2], dest[2], cb);
-				});
+				processCountryData(src[1], dest[1], cb);
 			});
 		}
 		else{
 			processCountryData(src, dest, cb);
 		}
-	} else if (type === 'city') {
-		processCityDataNames(src[0], dest[0], function() {
-			processCityData(src[1], dest[1], function() {
-				console.log("city data processed");
-				processCityData(src[2], dest[2], function() {
-					console.log(' DONE'.green);
-					cb();
-				});
-			});
-		});
 	}
 }
 

@@ -2,13 +2,10 @@
 
 'use strict';
 
-if(!process.env.npm_package_config_update){
-    return;
-}
+var user_agent = 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/39.0.2171.36 Safari/537.36';
 
-var cp = require('child_process');
 var fs = require('fs');
-var http = require('https');
+var https = require('https');
 var path = require('path');
 var url = require('url');
 var zlib = require('zlib');
@@ -21,242 +18,332 @@ var glob = require('glob');
 var iconv = require('iconv-lite');
 var lazy = require('lazy');
 var rimraf = require('rimraf').sync;
-var unzip = require('unzip');
+var yauzl = require('yauzl');
 var utils = require('../lib/utils');
+var Address6 = require('ip-address').Address6;
+var Address4 = require('ip-address').Address4;
 
 var dataPath = path.join(__dirname, '..', 'data');
 var tmpPath = path.join(__dirname, '..', 'tmp');
-
-var databases = [{
-type: 'country',
-          url: 'https://geolite.maxmind.com/download/geoip/database/GeoIPCountryCSV.zip',
-          src: 'GeoIPCountryWhois.csv',
-          dest: 'geoip-country.dat'
-}];
+var countryLookup = {};
+var databases = [
+	{
+		type: 'country',
+		url: 'https://geolite.maxmind.com/download/geoip/database/GeoLite2-Country-CSV.zip',
+		src: [
+			'GeoLite2-Country-Locations-en.csv',
+			'GeoLite2-Country-Blocks-IPv4.csv',
+		],
+		dest: [
+			'',
+			'geoip-country.dat',
+		]
+	}
+];
 
 function mkdir(name) {
-    var dir = path.dirname(name);
-    if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir);
-    }
+	var dir = path.dirname(name);
+	if (!fs.existsSync(dir)) {
+		fs.mkdirSync(dir);
+	}
 }
 
 // Ref: http://stackoverflow.com/questions/8493195/how-can-i-parse-a-csv-string-with-javascript
 // Return array of string values, or NULL if CSV string not well formed.
+// Return array of string values, or NULL if CSV string not well formed.
+
+function try_fixing_line(line) {
+	var pos1 = 0;
+	var pos2 = -1;
+	// escape quotes
+	line = line.replace(/""/,'\\"').replace(/'/g,"\\'");
+
+	while(pos1 < line.length && pos2 < line.length) {
+		pos1 = pos2;
+		pos2 = line.indexOf(',', pos1 + 1);
+		if(pos2 < 0) pos2 = line.length;
+		if(line.indexOf("'", (pos1 || 0)) > -1 && line.indexOf("'", pos1) < pos2 && line[pos1 + 1] != '"' && line[pos2 - 1] != '"') {
+			line = line.substr(0, pos1 + 1) + '"' + line.substr(pos1 + 1, pos2 - pos1 - 1) + '"' + line.substr(pos2, line.length - pos2);
+			pos2 = line.indexOf(',', pos2 + 1);
+			if(pos2 < 0) pos2 = line.length;
+		}
+	}
+	return line;
+}
+
 function CSVtoArray(text) {
-    var re_valid = /^\s*(?:'[^'\\]*(?:\\[\S\s][^'\\]*)*'|"[^"\\]*(?:\\[\S\s][^"\\]*)*"|[^,'"\s\\]*(?:\s+[^,'"\s\\]+)*)\s*(?:,\s*(?:'[^'\\]*(?:\\[\S\s][^'\\]*)*'|"[^"\\]*(?:\\[\S\s][^"\\]*)*"|[^,'"\s\\]*(?:\s+[^,'"\s\\]+)*)\s*)*$/;
-    var re_value = /(?!\s*$)\s*(?:'([^'\\]*(?:\\[\S\s][^'\\]*)*)'|"([^"\\]*(?:\\[\S\s][^"\\]*)*)"|([^,'"\s\\]*(?:\s+[^,'"\s\\]+)*))\s*(?:,|$)/g;
-    // Return NULL if input string is not well formed CSV string.
-    if (!re_valid.test(text)) return null;
-    var a = [];                     // Initialize array to receive values.
-    text.replace(re_value, // "Walk" the string using replace with callback.
-            function(m0, m1, m2, m3) {
-            // Remove backslash from \' in single quoted values.
-            if      (m1 !== undefined) a.push(m1.replace(/\\'/g, "'"));
-            // Remove backslash from \" in double quoted values.
-            else if (m2 !== undefined) a.push(m2.replace(/\\"/g, '"'));
-            else if (m3 !== undefined) a.push(m3);
-            return ''; // Return empty string.
-            });
-    // Handle special case of empty last value.
-    if (/,\s*$/.test(text)) a.push('');
-    return a;
+	var re_valid = /^\s*(?:'[^'\\]*(?:\\[\S\s][^'\\]*)*'|"[^"\\]*(?:\\[\S\s][^"\\]*)*"|[^,'"\s\\]*(?:\s+[^,'"\s\\]+)*)\s*(?:,\s*(?:'[^'\\]*(?:\\[\S\s][^'\\]*)*'|"[^"\\]*(?:\\[\S\s][^"\\]*)*"|[^,'"\s\\]*(?:\s+[^,'"\s\\]+)*)\s*)*$/;
+	var re_value = /(?!\s*$)\s*(?:'([^'\\]*(?:\\[\S\s][^'\\]*)*)'|"([^"\\]*(?:\\[\S\s][^"\\]*)*)"|([^,'"\s\\]*(?:\s+[^,'"\s\\]+)*))\s*(?:,|$)/g;
+	// Return NULL if input string is not well formed CSV string.
+	if (!re_valid.test(text)){
+		text  = try_fixing_line(text);
+		if(!re_valid.test(text))
+			return null;
+	}
+	var a = []; // Initialize array to receive values.
+	text.replace(re_value, // "Walk" the string using replace with callback.
+		function(m0, m1, m2, m3) {
+			// Remove backslash from \' in single quoted values.
+			if      (m1 !== undefined) a.push(m1.replace(/\\'/g, "'"));
+			// Remove backslash from \" in double quoted values.
+			else if (m2 !== undefined) a.push(m2.replace(/\\"/g, '"').replace(/\\'/g, "'"));
+			else if (m3 !== undefined) a.push(m3);
+			return ''; // Return empty string.
+		});
+	// Handle special case of empty last value.
+	if (/,\s*$/.test(text)) a.push('');
+	return a;
+};
+
+
+function fetch(database, cb) {
+
+	var downloadUrl = database.url;
+	var fileName = downloadUrl.split('/').pop();
+	var gzip = path.extname(fileName) === '.gz';
+
+	if (gzip) {
+		fileName = fileName.replace('.gz', '');
+	}
+
+	var tmpFile = path.join(tmpPath, fileName);
+
+	if (fs.existsSync(tmpFile)) {
+		return cb(null, tmpFile, fileName, database);
+	}
+
+	console.log('Fetching ', downloadUrl);
+
+	function getOptions() {
+		var options = url.parse(downloadUrl);
+		options.headers = {
+			'User-Agent': user_agent
+		};
+
+		if (process.env.http_proxy || process.env.https_proxy) {
+			try {
+				var HttpsProxyAgent = require('https-proxy-agent');
+				options.agent = new HttpsProxyAgent(process.env.http_proxy || process.env.https_proxy);
+			}
+			catch (e) {
+				console.error("Install https-proxy-agent to use an HTTP/HTTPS proxy");
+				process.exit(-1)
+			}
+		}
+
+		return options;
+	}
+
+	function onResponse(response) {
+		var status = response.statusCode;
+
+		if (status !== 200) {
+			console.log('ERROR'.red + ': HTTP Request Failed [%d %s]', status, https.STATUS_CODES[status]);
+			client.abort();
+			process.exit();
+		}
+
+		var tmpFilePipe;
+		var tmpFileStream = fs.createWriteStream(tmpFile);
+
+		if (gzip) {
+			tmpFilePipe = response.pipe(zlib.createGunzip()).pipe(tmpFileStream);
+		} else {
+			tmpFilePipe = response.pipe(tmpFileStream);
+		}
+
+		tmpFilePipe.on('close', function() {
+			console.log(' DONE'.green);
+			cb(null, tmpFile, fileName, database);
+		});
+	}
+
+	mkdir(tmpFile);
+
+	var client = https.get(getOptions(), onResponse);
+
+	process.stdout.write('Retrieving ' + fileName + ' ...');
 }
 
-function fetch(downloadUrl, cb) {
-    function getOptions() {
-        if (process.env.http_proxy) {
-            var options = url.parse(process.env.http_proxy);
-
-            options.path = downloadUrl;
-            options.headers = {
-Host: url.parse(downloadUrl).host
-            };
-
-            return options;
-        } else {
-            return url.parse(downloadUrl);
-        }
-    }
-
-    function onResponse(response) {
-        var status = response.statusCode;
-
-        if (status !== 200) {
-            console.log('ERROR'.red + ': HTTP Request Failed [%d %s]', status, http.STATUS_CODES[status]);
-            client.abort();
-            process.exit();
-        }
-
-        var tmpFilePipe;
-        var tmpFileStream = fs.createWriteStream(tmpFile);
-
-        if (gzip) {
-            tmpFilePipe = response.pipe(zlib.createGunzip()).pipe(tmpFileStream);
-        } else {
-            tmpFilePipe = response.pipe(tmpFileStream);
-        }
-
-        tmpFilePipe.on('close', function() {
-                console.log(' DONE'.green);
-                cb(tmpFile, fileName);
-                });
-    }
-
-    var fileName = downloadUrl.split('/').pop();
-    var gzip = (fileName.indexOf('.gz') !== -1);
-
-    if (gzip) {
-        fileName = fileName.replace('.gz', '');
-    }
-
-    var tmpFile = path.join(tmpPath, fileName);
-
-    mkdir(tmpFile);
-
-    var client = http.get(getOptions(), onResponse);
-
-    process.stdout.write('Retrieving ' + fileName + ' ...');
+function extract(tmpFile, tmpFileName, database, cb) {
+	if (path.extname(tmpFileName) !== '.zip') {
+		cb(null, database);
+	} else {
+		process.stdout.write('Extracting ' + tmpFileName + ' ...');
+		yauzl.open(tmpFile, {autoClose: true, lazyEntries: true}, function(err, zipfile) {
+			if (err) {
+				throw err;
+			}
+			zipfile.readEntry();
+			zipfile.on("entry", function(entry) {
+				if (/\/$/.test(entry.fileName)) {
+					// Directory file names end with '/'.
+					// Note that entries for directories themselves are optional.
+					// An entry's fileName implicitly requires its parent directories to exist.
+					zipfile.readEntry();
+				} else {
+					// file entry
+					zipfile.openReadStream(entry, function(err, readStream) {
+						if (err) {
+							throw err;
+						}
+						readStream.on("end", function() {
+							zipfile.readEntry();
+						});
+						var filePath = entry.fileName.split("/");
+						// filePath will always have length >= 1, as split() always returns an array of at least one string
+						var fileName = filePath[filePath.length - 1];
+						readStream.pipe(fs.createWriteStream(path.join(tmpPath, fileName)));
+					});
+				}
+			});
+			zipfile.once("end", function() {
+				cb(null, database);
+			});
+		});
+	}
 }
+function processLookupCountry(src, cb){
+	var lines=0;
+	function processLine(line) {
+		var fields = CSVtoArray(line);
+		if (!fields || fields.length < 6) {
+			console.log("weird line: %s::", line);
+			return;
+		}
+		countryLookup[fields[0]] = fields[4];
+	}
+	var tmpDataFile = path.join(tmpPath, src);
 
-function extract(tmpFile, tmpFileName, cb) {
-    if (tmpFileName.indexOf('.zip') === -1) {
-        cb();
-    } else {
-        process.stdout.write('Extracting ' + tmpFileName + ' ...');
+	process.stdout.write('Processing Lookup Data (may take a moment) ...');
+	var tstart = Date.now();
 
-        var unzipStream = unzip.Extract({
-path: path.dirname(tmpFile)
-});
-
-var pipeSteam = fs.createReadStream(tmpFile).pipe(unzipStream);
-
-pipeSteam.on('end', function() {
-        console.log(' DONE'.green);
-
-        if (tmpFileName.indexOf('GeoLiteCity') !== -1) {
-        var oldPath = path.join(tmpPath, path.basename(tmpFileName, '.zip'));
-        if(!fs.existsSync(oldPath)) {
-        if(/-latest$/.test(oldPath)) {
-        var prefix = oldPath.replace(/-latest$/, '');
-        oldPath = glob.sync(prefix + '_*')[0];
-        }
-        }
-
-        var newPath = path.join(tmpPath, 'GeoLiteCity');
-        fs.renameSync(oldPath, newPath);
-        }
-
-        cb();
-        });
-}
+	lazy(fs.createReadStream(tmpDataFile))
+		.lines
+		.map(function(byteArray) {
+			return iconv.decode(byteArray, 'latin1');
+		})
+		.skip(1)
+		.map(processLine)
+		.on('pipe', function() {
+			console.log(' DONE'.green);
+			cb();
+		});
 }
 
 function processCountryData(src, dest, cb) {
-    var lines=0;
-    function processLine(line) {
-        var fields = CSVtoArray(line);
+	var lines=0;
+	function processLine(line) {
+		var fields = CSVtoArray(line);
 
-        if (fields.length < 6) {
-            console.log("weird line: %s::", line);
-            return;
-        }
-        lines++;
+		if (!fields || fields.length < 6) {
+			console.log("weird line: %s::", line);
+			return;
+		}
+		lines++;
 
-        var sip;
-        var eip;
-        var cc = fields[4].replace(/"/g, '');
-        var b;
-        var bsz;
-        var i;
+		var sip;
+		var eip;
+		var rngip;
+		var cc = countryLookup[fields[1]];
+		var b;
+		var bsz;
+		var i;
+		if(cc){
+			if (fields[0].match(/:/)) {
+				// IPv6
+				bsz = 34;
+				rngip = new Address6(fields[0]);
+				sip = utils.aton6(rngip.startAddress().correctForm());
+				eip = utils.aton6(rngip.endAddress().correctForm());
 
-        if (fields[0].match(/:/)) {
-            // IPv6
-            bsz = 34;
-            sip = utils.aton6(fields[0]);
-            eip = utils.aton6(fields[1]);
+				b = Buffer.alloc(bsz);
+				for (i = 0; i < sip.length; i++) {
+					b.writeUInt32BE(sip[i], i * 4);
+				}
 
-            b = new Buffer(bsz);
-            for (i = 0; i < sip.length; i++) {
-                b.writeUInt32BE(sip[i], i * 4);
-            }
+				for (i = 0; i < eip.length; i++) {
+					b.writeUInt32BE(eip[i], 16 + (i * 4));
+				}
+			} else {
+				// IPv4
+				bsz = 10;
 
-            for (i = 0; i < eip.length; i++) {
-                b.writeUInt32BE(eip[i], 16 + (i * 4));
-            }
-        } else {
-            // IPv4
-            bsz = 10;
+				rngip = new Address4(fields[0]);
+				sip = parseInt(rngip.startAddress().bigInteger(),10);
+				eip = parseInt(rngip.endAddress().bigInteger(),10);
 
-            sip = parseInt(fields[2].replace(/"/g, ''), 10);
-            eip = parseInt(fields[3].replace(/"/g, ''), 10);
+				b = Buffer.alloc(bsz);
+				b.fill(0);
+				b.writeUInt32BE(sip, 0);
+				b.writeUInt32BE(eip, 4);
+			}
 
-            b = new Buffer(bsz);
-            b.fill(0);
-            b.writeUInt32BE(sip, 0);
-            b.writeUInt32BE(eip, 4);
-        }
+			b.write(cc, bsz - 2);
 
-        b.write(cc, bsz - 2);
-
-        fs.writeSync(datFile, b, 0, bsz, null);
-        if(Date.now() - tstart > 5000) {
-            tstart = Date.now();
-            process.stdout.write('\nStill working (' + lines + ') ...');
-        }
+			fs.writeSync(datFile, b, 0, bsz, null);
+			if(Date.now() - tstart > 5000) {
+				tstart = Date.now();
+				process.stdout.write('\nStill working (' + lines + ') ...');
+			}
+		}
     }
 
     var dataFile = path.join(dataPath, dest);
-    var tmpDataFile = path.join(tmpPath, src);
+	var tmpDataFile = path.join(tmpPath, src);
 
-    rimraf(dataFile);
-    mkdir(dataFile);
+	rimraf(dataFile);
+	mkdir(dataFile);
 
-    process.stdout.write('Processing Data (may take a moment) ...');
-    var tstart = Date.now();
-    var datFile = fs.openSync(dataFile, "w");
+	process.stdout.write('Processing Data (may take a moment) ...');
+	var tstart = Date.now();
+	var datFile = fs.openSync(dataFile, "w");
 
-    lazy(fs.createReadStream(tmpDataFile))
-        .lines
-        .map(function(byteArray) {
-                return iconv.decode(byteArray, 'latin1');
-                })
-    .skip(1)
-        .map(processLine)
-        .on('pipe', function() {
-                console.log(' DONE'.green);
-                cb();
-                });
+	lazy(fs.createReadStream(tmpDataFile))
+		.lines
+		.map(function(byteArray) {
+			return iconv.decode(byteArray, 'latin1');
+		})
+		.skip(1)
+		.map(processLine)
+		.on('pipe', function() {
+			console.log(' DONE'.green);
+			cb();
+		});
 }
 
+function processData(database, cb) {
+	var type = database.type;
+	var src = database.src;
+	var dest = database.dest;
 
-function processData(type, src, dest, cb) {
-    if (type === 'country') {
-        processCountryData(src, dest, cb);
-    }
+	if (type === 'country') {
+		if(Array.isArray(src)){
+			processLookupCountry(src[0], function() {
+				processCountryData(src[1], dest[1], cb);
+			});
+		}
+		else{
+			processCountryData(src, dest, cb);
+		}
+	}
 }
 
 rimraf(tmpPath);
 mkdir(tmpPath);
 
-async.forEachSeries(databases, function(database, nextDatabase) {
-        fetch(database.url, function(tmpFile, tmpFileName) {
-            extract(tmpFile, tmpFileName, function() {
-                processData(database.type, database.src, database.dest, function() {
-                    console.log();
-                    nextDatabase();
-                    });
-                });
-            });
-        }, function(err) {
-        console.log();
+async.eachSeries(databases, function(database, nextDatabase) {
 
-        if (err) {
-        console.log('Failed to Update Databases from MaxMind.'.red);
-        process.exit();
-        } else {
-        console.log('Successfully Updated Databases from MaxMind.'.green);
-        if (process.argv[2]=='debug') console.log('Notice: temporary files are not deleted for debug purposes.'.bold.yellow);
-        else rimraf(tmpPath);
-        }
-        });
+	async.seq(fetch, extract, processData)(database, nextDatabase);
+
+}, function(err) {
+	if (err) {
+		console.log('Failed to Update Databases from MaxMind.'.red);
+		process.exit(1);
+	} else {
+		console.log('Successfully Updated Databases from MaxMind.'.green);
+		if (process.argv[2] == 'debug') console.log('Notice: temporary files are not deleted for debug purposes.'.bold.yellow);
+		else rimraf(tmpPath);
+		process.exit(0);
+	}
+});

@@ -35,13 +35,15 @@
     "postinstall": "npm run-script updatedb"
   },
   "dependencies": {
-    "async": "~0.1.22",
+    "async": "^2.1.1",
     "colors": "0.6.0-1",
     "glob": "~3.2.1",
     "iconv-lite": "~0.2.11",
+    "ip-address": "^5.8.9",
     "lazy": "~1.0.11",
     "rimraf": "~2.0.2",
-    "unzip": "~0.0.4"
+    "unzip": "~0.0.4",
+    "yauzl": "^2.10.0"
   },
   "config": {
     "update": true
